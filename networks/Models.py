@@ -2,6 +2,7 @@ from turtle import forward
 from typing import Union
 import torch
 import torch.nn as nn
+from torch.optim import RMSprop
 import sys
 
 class DeclarationModel(nn.Module):
@@ -227,3 +228,26 @@ class ValueModel(nn.Module):
         # x = torch.relu(x)
         # x = self.fc4(x)
         return x
+
+class Coach(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.loss_fn = nn.BCELoss()
+
+        self.fc = nn.Sequential(
+            nn.Linear(564, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1),
+            nn.Sigmoid()
+        )
+
+        self.optimizer = RMSprop(self.parameters(), lr=0.0001, alpha=0.99, eps=1e-5)
+    
+    def forward(self, x: torch.Tensor):
+        x = self.fc(x)
+        return x.squeeze(-1)

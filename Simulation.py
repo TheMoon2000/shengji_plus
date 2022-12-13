@@ -4,20 +4,26 @@ import random
 from typing import Deque, Dict, List, Tuple
 from agents.Agent import RandomAgent, SJAgent
 from agents.RLAgents import KittyArgmaxAgent, QLearningMainAgent
+from env.InitialState import InitialState
 from env.Observation import Observation
 from env.utils import AbsolutePosition 
 from env.Game import Game, Stage
 from env.Actions import *
 from collections import deque
 
+from networks.Models import Coach
+
 class Simulation:
-    def __init__(self, main_agent: SJAgent, declare_agent: SJAgent, kitty_agent: SJAgent, chaodi_agent: SJAgent = None, discount=0.99, enable_combos=False, eval=False, eval_main: SJAgent = None, eval_declare: SJAgent = None, eval_kitty: SJAgent = None, eval_chaodi: SJAgent = None, epsilon=0.98, learn_from_eval=False, warmup_games=0, tutorial_prob=0.0, oracle_duration=0) -> None:
+
+    def __init__(self, main_agent: SJAgent, declare_agent: SJAgent, kitty_agent: SJAgent, chaodi_agent: SJAgent = None, discount=0.99, enable_combos=False, eval=False, eval_main: SJAgent = None, eval_declare: SJAgent = None, eval_kitty: SJAgent = None, eval_chaodi: SJAgent = None, epsilon=0.98, learn_from_eval=False, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, coach_model: Coach = None) -> None:
         "If eval = True, use random agents for East and West."
 
         self.remaining_warmup_games = warmup_games
         self.tutorial_prob = tutorial_prob
         self.oracle_duration = oracle_duration
         self.game_count = 0
+        self.coach_model = None
+        self.coach_model = coach_model
 
         self.main_agent = main_agent
         self.declare_agent = declare_agent
@@ -103,6 +109,9 @@ class Simulation:
 
         self.cumulative_rewards = not isinstance(main_agent, QLearningMainAgent) # Whether to compute cumulative rewards at the end
 
+        # For coach training
+        self.initial_hand_history: List[Tuple[InitialState, float]] = []
+
     def step(self):
         "Step the game and return whether the game is still ongoing."
         if not self.game_engine.game_started:
@@ -129,6 +138,26 @@ class Simulation:
                 elif self.game_engine.stage == Stage.chaodi_stage:
                     action = self.chaodi_agent.act(observation, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
                 else:
+                    if self.coach_model and self.game_engine.unplayed_cards.size == 108:
+                        initial_state = InitialState(
+                            self.game_engine.hands[self.game_engine.dealer_position].copy(),
+                            self.game_engine.hands[self.game_engine.dealer_position.next_position.next_position].copy(),
+                            self.game_engine.hands[self.game_engine.dealer_position.last_position].copy(),
+                            self.game_engine.hands[self.game_engine.dealer_position.next_position].copy(),
+                            self.game_engine.dominant_rank,
+                            self.game_engine.declarations[-1] if self.game_engine.declarations else None,
+                            self.game_engine.kitty.copy(),
+                            self.game_engine.chaodi_times,
+                            self.game_engine.dealer_position
+                        )
+                        with torch.no_grad():
+                            pred_wr = self.coach_model(initial_state.dynamic_tensor.cuda())
+                            if self.game_count >= 100 and abs(0.5 - pred_wr) <= 0.3:
+                                # play the game and record the data
+                                self.initial_hand_history.append((initial_state, None))
+                            else:
+                                self.soft_reset()
+                                return False, None
                     action = self.main_agent.act(observation, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
             
             last_stage = self.game_engine.stage
@@ -158,6 +187,7 @@ class Simulation:
                 
                 # Determine who won and update the win count
                 if self.game_engine.opponent_points >= 80:
+                    self.initial_hand_history[-1] = (self.initial_hand_history[-1][0], 0.0)
                     if self.game_engine.dealer_position in [AbsolutePosition.NORTH, AbsolutePosition.SOUTH]:
                         self.win_counts[1] += 1
                         self.level_counts[1] += self.game_engine.final_opponent_reward
@@ -165,6 +195,7 @@ class Simulation:
                         self.win_counts[0] += 1
                         self.level_counts[0] += self.game_engine.final_opponent_reward
                 else:
+                    self.initial_hand_history[-1] = (self.initial_hand_history[-1][0], 1.0)
                     if self.game_engine.dealer_position in [AbsolutePosition.NORTH, AbsolutePosition.SOUTH]:
                         self.win_counts[0] += 1
                         self.level_counts[0] += self.game_engine.final_defender_reward
@@ -276,7 +307,7 @@ class Simulation:
         else:
             return max(0, (self.oracle_duration - self.game_count) / self.oracle_duration)
     
-    def reset(self, reuse_old_deck=False):
+    def soft_reset(self, reuse_old_deck=False):
         old_deck = self.game_engine.card_list
         old_dealer = self.game_engine.dealer_position
         if self.remaining_warmup_games > 0:
@@ -298,15 +329,21 @@ class Simulation:
                 tutorial_prob=self.tutorial_prob,
                 oracle_value=self.oracle_value
             )
-        self.main_history.clear()
-        self.declaration_history.clear()
-        self.chaodi_history.clear()
-        self.kitty_history.clear()
-
+        
         # If reuse_old_deck, then re-play the game using the same hands
         if not self.game_engine.is_warmup_game and reuse_old_deck:
             self.game_engine.deck = iter(old_deck)
             self.game_engine.dealer_position = old_dealer
+        
+    # Hard reset (clear all data as well)
+    def reset(self, reuse_old_deck=False):
+        self.soft_reset(reuse_old_deck)
+
+        self.main_history.clear()
+        self.declaration_history.clear()
+        self.chaodi_history.clear()
+        self.kitty_history.clear()
+        self.initial_hand_history.clear()
     
     def backprop(self):
         self.declare_agent.learn_from_samples(self.declaration_history)

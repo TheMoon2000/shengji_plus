@@ -78,7 +78,7 @@ class Observation:
     
     @property
     def trump_tensor(self):
-        "Returns a (20,) tensor representing the current trump suite and trump rank."
+        "Returns a (20,) tensor representing the current trump suit and trump rank."
         rank_tensor = torch.zeros(13)
         rank_tensor[self.dominant_rank - 2] = 1
 

@@ -316,7 +316,7 @@ class ChaodiAgent(DeepAgent):
     
 class MainAgent(DeepAgent):
     def __init__(self, name: str, model: MainModel, batch_size=64, hash_model: StateAutoEncoder = None, tau=0.1) -> None:
-        super().__init__(name, model, batch_size, hash_model, tau, use_oracle=getattr(model, 'use_oracle', False))
+        super().__init__(name, model, batch_size, hash_model, tau, use_oracle=model.use_oracle)
         self.model: MainModel
     
     def act(self, obs: Observation, explore=False, epsilon=None, training=True):

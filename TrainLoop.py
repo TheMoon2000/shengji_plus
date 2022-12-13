@@ -18,10 +18,11 @@ global_main_queue = ctx.Queue(maxsize=30)
 global_chaodi_queue = ctx.Queue(maxsize=30)
 global_declare_queue = ctx.Queue(maxsize=30)
 global_kitty_queue = ctx.Queue(maxsize=30)
+global_coach_queue = ctx.Queue(maxsize=30)
 actor_processes = []
 
 # Parallelized data sampling
-def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, combos, epsilon=0.01, reuse_prob=0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0):
+def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, global_coach_queue, combos, epsilon=0.01, reuse_prob=0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, coach_model=None):
     train_sim = Simulation(
         main_agent=main_agent,
         declare_agent=declare_agent,
@@ -32,10 +33,11 @@ def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, disc
         epsilon=0.2,
         warmup_games=warmup_games,
         tutorial_prob=tutorial_prob,
-        oracle_duration=oracle_duration
+        oracle_duration=oracle_duration,
+        coach_model=coach_model
     )
     while True:
-        local_main, local_declare, local_kitty, local_chaodi = [], [], [], []
+        local_main, local_declare, local_kitty, local_chaodi, local_coach = [], [], [], [], []
         for i in range(10):
             with torch.no_grad():
                 while train_sim.step()[0]: pass
@@ -43,6 +45,7 @@ def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, disc
                 local_declare.extend(train_sim.declaration_history[:])
                 local_chaodi.extend(train_sim.chaodi_history[:])
                 local_kitty.extend(train_sim.kitty_history[:])
+                local_coach.extend(train_sim.initial_hand_history[:])
             
             train_sim.reset(reuse_old_deck=random.random() < reuse_prob)
         train_sim.epsilon = max(epsilon, train_sim.epsilon / decay_factor)
@@ -50,6 +53,7 @@ def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, disc
         global_declare_queue.put(local_declare)
         global_chaodi_queue.put(local_chaodi)
         global_kitty_queue.put(local_kitty)
+        global_coach_queue.put(local_coach)
 
 def evaluator(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, eval_main, eval_declare, eval_kitty, eval_chaodi, combos, eval_size, eval_results_queue: Queue, verbosity=logging.WARNING, learn_from_eval=False):
     logging.getLogger().setLevel(verbosity)
@@ -86,7 +90,7 @@ def evaluator(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, ev
     exit(0)
 
 
-def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, use_hash_exploration=False, hash_length=16, model_type='mc', tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_old_deck_prob=0.0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0):
+def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, use_hash_exploration=False, hash_length=16, model_type='mc', tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_old_deck_prob=0.0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, use_coach=False):
     os.makedirs(model_folder, exist_ok=True)
     torch.manual_seed(0)
     random.seed(random_seed)
@@ -144,10 +148,7 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
         chaodi_model.load_state_dict(torch.load(f'{model_folder}/chaodi.pt', map_location=device), strict=False)
         print("Using loaded model for chaodi")
     chaodi_agent = ChaodiAgent('chaodi', chaodi_model, tau=tau)
-    try:
-        main_model = train_models.MainModel(use_oracle=oracle_duration > 0).to(device)
-    except:
-        main_model = train_models.MainModel().to(device)
+    main_model = train_models.MainModel(use_oracle=oracle_duration > 0).to(device)
     if os.path.exists(f'{model_folder}/main.pt'):
         main_model.load_state_dict(torch.load(f'{model_folder}/main.pt', map_location=device), strict=False)
         print("Using loaded model for main game")
@@ -163,10 +164,19 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
 
         main_agent = QLearningMainAgent('main', main_model, value_model, discount=discount, hash_model=hash_autoencoder, tau=tau)
     
+    if use_coach:
+        coach_model = Coach().to(device)
+        if os.path.exists(f'{model_folder}/coach.pt'):
+            coach_model.load_state_dict(torch.load(f'{model_folder}/coach.pt', map_location=device), strict=False)
+            print("Using loaded model for coach network")
+    else:
+        coach_model = None
+    
     declare_model.share_memory()
     kitty_model.share_memory()
     chaodi_model.share_memory()
     main_model.share_memory()
+    coach_model.share_memory()
 
     eval_main, eval_kitty, eval_chaodi, eval_declare = None, None, None, None
     if compare:
@@ -237,6 +247,8 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
                 hash_autoencoder.optimizer.load_state_dict(state['hash_model_optim_state'])
             if isinstance(main_agent, QLearningMainAgent):
                 main_agent.value_optimizer.load_state_dict(state['value_optim_state'])
+            if coach_model:
+                coach_model.optimizer.load_state_dict(state['coach_optim_state'])
             print(f"Using checkpoint at iteration {iterations}")
         with open(f'{model_folder}/stats.pkl', mode='rb') as f:
             stats = pickle.load(f)
@@ -246,9 +258,9 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
         shutil.copyfile('networks/Models.py', f'{model_folder}/Models.py')
     
     if not eval_only:
-        processes_count = 10
+        processes_count = 8
         for i in range(1 if single_process else processes_count):
-            actor = ctx.Process(target=sampler, args=(i, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor ** (1 / games), global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, combos, epsilon, reuse_old_deck_prob, warmup_games // processes_count, tutorial_prob, oracle_duration // processes_count))
+            actor = ctx.Process(target=sampler, args=(i, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor ** (1 / games), global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, global_coach_queue, combos, epsilon, reuse_old_deck_prob, warmup_games // processes_count, tutorial_prob, oracle_duration // processes_count, coach_model))
             actor.start()
             actor_processes.append(actor)
             
@@ -261,6 +273,7 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
     while True:
         if not eval_only:
             print(f"Training iterations {iterations * games}-{(iterations+1) * games}...")
+            coach_losses = []
             for _ in tqdm.tqdm(range(0, games, 10)):
                 # print('wait', global_main_queue.qsize(), global_declare_queue.qsize(), global_kitty_queue.qsize(), global_chaodi_queue.qsize())
                 declare_batch = global_declare_queue.get()
@@ -271,9 +284,27 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
                 kitty_agent.learn_from_samples(kitty_batch)
                 chaodi_agent.learn_from_samples(chaodi_batch)
                 main_agent.learn_from_samples(main_batch)
+                if coach_model:
+                    coach_batch = global_coach_queue.get()
+                    coach_X = torch.zeros((len(coach_batch), 564), device=device)
+                    coach_Y = torch.zeros(len(coach_batch), device=device)
+                    for i, (ih, outcome) in enumerate(coach_batch):
+                        coach_X[i] = ih.dynamic_tensor.to(device)
+                        coach_Y[i] = outcome
+                    pred = coach_model(coach_X)
+                    coach_loss = coach_model.loss_fn(pred, coach_Y)
+                    coach_model.optimizer.zero_grad()
+                    coach_loss.backward()
+                    coach_model.optimizer.step()
+                    print(coach_loss.cpu().detach().item())
+                    coach_losses.append(coach_loss.cpu().detach().item())
             for agent in (declare_agent, kitty_agent, chaodi_agent, main_agent):
                 torch.save(agent.model.state_dict(), f'{model_folder}/{agent.name}.pt')
+            if coach_model:
+                torch.save(coach_model.state_dict(), f'{model_folder}/coach.pt')
             print('main loss:', np.mean(main_agent.train_loss_history), 'declare loss:', np.mean(declare_agent.train_loss_history), 'kitty loss:', np.mean(kitty_agent.train_loss_history), 'chaodi loss:', np.mean(chaodi_agent.train_loss_history))
+            if coach_loss:
+                print('coach loss:', np.mean(coach_loss))
             
             if use_hash_exploration:
                 torch.save(hash_autoencoder.state_dict(), f'{model_folder}/state_ae.pt')
@@ -392,6 +423,7 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
                     'chaodi_optim_state': chaodi_agent.optimizer.state_dict(),
                     'hash_model_optim_state': hash_autoencoder.optimizer.state_dict() if hash_autoencoder else None,
                     'value_optim_state': main_agent.value_optimizer.state_dict() if isinstance(main_agent, QLearningMainAgent) else None,
+                    'coach_optim_state': coach_model.optimizer.state_dict() if coach_model else None,
                     'oracle_duration': oracle_duration
                 }, f)
         else:
@@ -423,5 +455,6 @@ if __name__ == '__main__':
     parser.add_argument('--warmup-games', type=int, default=0)
     parser.add_argument('--tutorial-prob', type=float, default=0.0)
     parser.add_argument('--oracle-duration', type=int, default=0)
+    parser.add_argument('--use-coach', action='store_true')
     args = parser.parse_args()
-    train(args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.hash_exploration, args.hash_length, args.model_type, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_old_deck_prob, args.warmup_games, args.tutorial_prob, args.oracle_duration)
+    train(args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.hash_exploration, args.hash_length, args.model_type, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_old_deck_prob, args.warmup_games, args.tutorial_prob, args.oracle_duration, args.use_coach)
