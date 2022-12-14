@@ -27,9 +27,10 @@ class DeclarationModel(nn.Module):
 
 class KittyModel(nn.Module):
     "The kitty model's observation includes: the player's cards, the player's position relative to the dealer, current declaration, position of current declaration, known trump cards in each player's hand (same as those in DeclarationModel)."
-    def __init__(self) -> None:
+    def __init__(self, dynamic_kitty=False) -> None:
         super().__init__()
 
+        self.dynamic_kitty = dynamic_kitty
         self.single_card_embedding = nn.Embedding(54, 54)
         self.fc1 = nn.Linear(172 + 54, 256)
         self.fc2 = nn.Linear(256, 256)
@@ -41,7 +42,11 @@ class KittyModel(nn.Module):
         Performs the forward pass of kitty placement reward prediction. The input tensors should have shape (B, 172) and (B,), where B is the batch dimension. The first 172 values are for the observation, and the last B values are the indexes of the card to discard.
         """
 
-        card_embeddings = self.single_card_embedding(card)
+        if self.dynamic_kitty:
+            card_embeddings = torch.zeros((x.shape[0], 54), device=x.device)
+            card_embeddings[torch.arange(x.shape[0], dtype=torch.long), card.long()] = 1
+        else:
+            card_embeddings = self.single_card_embedding(card)
 
         x = self.fc1(torch.hstack([x, card_embeddings]))
         x = torch.relu(x)

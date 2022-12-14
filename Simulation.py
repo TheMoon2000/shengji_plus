@@ -14,8 +14,7 @@ from collections import deque
 from networks.Models import Coach
 
 class Simulation:
-
-    def __init__(self, main_agent: SJAgent, declare_agent: SJAgent, kitty_agent: SJAgent, chaodi_agent: SJAgent = None, discount=0.99, enable_combos=False, eval=False, eval_main: SJAgent = None, eval_declare: SJAgent = None, eval_kitty: SJAgent = None, eval_chaodi: SJAgent = None, epsilon=0.98, learn_from_eval=False, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, coach_model: Coach = None) -> None:
+    def __init__(self, main_agent: SJAgent, declare_agent: SJAgent, kitty_agent: SJAgent, chaodi_agent: SJAgent = None, discount=0.99, enable_combos=False, eval=False, eval_main: SJAgent = None, eval_declare: SJAgent = None, eval_kitty: SJAgent = None, eval_chaodi: SJAgent = None, epsilon=0.98, learn_from_eval=False, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, explore=False, coach_model: Coach = None) -> None:
         "If eval = True, use random agents for East and West."
 
         self.remaining_warmup_games = warmup_games
@@ -24,6 +23,7 @@ class Simulation:
         self.game_count = 0
         self.coach_model = None
         self.coach_model = coach_model
+        self.explore = explore
 
         self.main_agent = main_agent
         self.declare_agent = declare_agent
@@ -132,11 +132,11 @@ class Simulation:
             else:
                 # Depending on the stage of the game, we use different agents to calculate an action
                 if self.game_engine.stage == Stage.declare_stage:
-                    action = self.declare_agent.act(observation, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
+                    action = self.declare_agent.act(observation, explore=self.explore, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
                 elif self.game_engine.stage == Stage.kitty_stage:
-                    action = self.kitty_agent.act(observation, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
+                    action = self.kitty_agent.act(observation, explore=self.explore, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
                 elif self.game_engine.stage == Stage.chaodi_stage:
-                    action = self.chaodi_agent.act(observation, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
+                    action = self.chaodi_agent.act(observation, explore=self.explore, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
                 else:
                     if self.coach_model and self.game_engine.unplayed_cards.size == 108:
                         initial_state = InitialState(
@@ -152,13 +152,14 @@ class Simulation:
                         )
                         with torch.no_grad():
                             pred_wr = self.coach_model(initial_state.dynamic_tensor.cuda())
-                            if self.game_count >= 100 and abs(0.5 - pred_wr) <= 0.3:
-                                # play the game and record the data
-                                self.initial_hand_history.append((initial_state, None))
-                            else:
+                            if self.game_count >= 500 and abs(0.5 - pred_wr) > 0.3:
                                 self.soft_reset()
-                                return False, None
-                    action = self.main_agent.act(observation, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
+                                return True, None
+                            else:
+                                self.initial_hand_history.append((initial_state, None))
+
+                    
+                    action = self.main_agent.act(observation, explore=self.explore, epsilon=not self.eval_mode and self.epsilon, training=not self.eval_mode)
             
             last_stage = self.game_engine.stage
             last_player = self.current_player
@@ -187,7 +188,8 @@ class Simulation:
                 
                 # Determine who won and update the win count
                 if self.game_engine.opponent_points >= 80:
-                    self.initial_hand_history[-1] = (self.initial_hand_history[-1][0], 0.0)
+                    if self.coach_model:
+                        self.initial_hand_history[-1] = (self.initial_hand_history[-1][0], 0.0)
                     if self.game_engine.dealer_position in [AbsolutePosition.NORTH, AbsolutePosition.SOUTH]:
                         self.win_counts[1] += 1
                         self.level_counts[1] += self.game_engine.final_opponent_reward
@@ -195,7 +197,8 @@ class Simulation:
                         self.win_counts[0] += 1
                         self.level_counts[0] += self.game_engine.final_opponent_reward
                 else:
-                    self.initial_hand_history[-1] = (self.initial_hand_history[-1][0], 1.0)
+                    if self.coach_model:
+                        self.initial_hand_history[-1] = (self.initial_hand_history[-1][0], 1.0)
                     if self.game_engine.dealer_position in [AbsolutePosition.NORTH, AbsolutePosition.SOUTH]:
                         self.win_counts[0] += 1
                         self.level_counts[0] += self.game_engine.final_defender_reward
@@ -225,13 +228,14 @@ class Simulation:
                         # For kitty action, the reward is not discounted because each move is equally important
                         for i in reversed(range(len(self._kitty_history_per_player[position]))):
                             ob, ac, rw = self._kitty_history_per_player[position][i]
-                            if i + 1 == len(self._kitty_history_per_player[position]):
-                                if is_defender(ob.position):
-                                    rw += self.game_engine.final_defender_reward
-                                else:
-                                    rw += self.game_engine.final_opponent_reward
+                            # if i + 1 == len(self._kitty_history_per_player[position]):
+                            if is_defender(ob.position):
+                                rw += self.game_engine.final_defender_reward * ((i % 8) / 8 + 1 / 8)
                             else:
-                                rw += self._kitty_history_per_player[position][i + 1][2]
+                                rw += self.game_engine.final_opponent_reward * ((i % 8) / 8 + 1 / 8)
+                            # else:
+                            #     rw += self._kitty_history_per_player[position][i + 1][2]
+                            self._kitty_history_per_player[position][i] = (ob, ac, rw)
                             self.kitty_history.append((ob, ac, rw))
                         self._kitty_history_per_player[position].clear()
                     else:
@@ -277,17 +281,18 @@ class Simulation:
                         # Add rewards for points earned / lost in current round
                         if is_defender(ob.position):
                             if self.game_engine.points_per_round[i] >= 0:
-                                rw += self.game_engine.points_per_round[i] / 40 # Defenders are only moderately happy when escaping points
+                                rw += self.game_engine.points_per_round[i] / 80 # Defenders are only moderately happy when escaping points
                             else:
-                                rw += self.game_engine.points_per_round[i] / 40 # Defenders should care a lot about losing points
+                                rw += self.game_engine.points_per_round[i] / 60 # Defenders should care a lot about losing points
                         else:
                             if self.game_engine.points_per_round[i] <= 0:
-                                rw -= self.game_engine.points_per_round[i] / 40 # Opponents are happier when earning points
+                                rw -= self.game_engine.points_per_round[i] / 60 # Opponents are happier when earning points
                             else:
-                                rw -= self.game_engine.points_per_round[i] / 40 # Opponents are not so sad when they lose points
+                                rw -= self.game_engine.points_per_round[i] / 80 # Opponents are not so sad when they lose points
                         
                         next_ob = None
-                        # next_ob = self._main_history_per_player[position][i + 1][0] if i+1 < len(self._main_history_per_player[position]) else None
+                        if not self.cumulative_rewards:
+                            next_ob = self._main_history_per_player[position][i + 1][0] if i+1 < len(self._main_history_per_player[position]) else None
                         self._main_history_per_player[position][i] = (ob, ac, rw, next_ob)
                         
                         self.main_history.append(self._main_history_per_player[position][i])

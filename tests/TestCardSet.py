@@ -379,6 +379,14 @@ class TestCardSet(unittest.TestCase):
         for suit in [TrumpSuite.HEART, TrumpSuite.SPADE, TrumpSuite.XJ, TrumpSuite.DJ]:
             for rank in range(2, 15):
                 self.assertEqual(CardSet.from_dynamic_tensor(half_deck.get_dynamic_tensor(suit, rank), suit, rank), half_deck)
+    
+    def test_random_hand(self):
+        random.seed(10)
+        full_deck, order = CardSet.new_deck()
+        cardset = CardSet()
+        for card in order[:25]:
+            cardset.add_card(card)
+        print(cardset)
 
 if __name__ == '__main__':
     unittest.main()

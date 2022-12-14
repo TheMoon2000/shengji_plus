@@ -22,7 +22,7 @@ global_coach_queue = ctx.Queue(maxsize=30)
 actor_processes = []
 
 # Parallelized data sampling
-def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, global_coach_queue, combos, epsilon=0.01, reuse_prob=0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, coach_model=None):
+def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor, global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, global_coach_queue, combos, epsilon=0.01, reuse_times=0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, explore=False, coach_model=None):
     train_sim = Simulation(
         main_agent=main_agent,
         declare_agent=declare_agent,
@@ -34,10 +34,12 @@ def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, disc
         warmup_games=warmup_games,
         tutorial_prob=tutorial_prob,
         oracle_duration=oracle_duration,
+        explore=explore,
         coach_model=coach_model
     )
     while True:
         local_main, local_declare, local_kitty, local_chaodi, local_coach = [], [], [], [], []
+        same_deck_count = 0
         for i in range(10):
             with torch.no_grad():
                 while train_sim.step()[0]: pass
@@ -47,7 +49,13 @@ def sampler(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, disc
                 local_kitty.extend(train_sim.kitty_history[:])
                 local_coach.extend(train_sim.initial_hand_history[:])
             
-            train_sim.reset(reuse_old_deck=random.random() < reuse_prob)
+            # Get new deck every `reuse_times` times
+            if same_deck_count < reuse_times:
+                same_deck_count += 1
+                train_sim.reset(reuse_old_deck=True)
+            else:
+                same_deck_count = 0
+                train_sim.reset(reuse_old_deck=False)
         train_sim.epsilon = max(epsilon, train_sim.epsilon / decay_factor)
         global_main_queue.put(local_main)
         global_declare_queue.put(local_declare)
@@ -90,7 +98,7 @@ def evaluator(idx: int, main_agent, declare_agent, kitty_agent, chaodi_agent, ev
     exit(0)
 
 
-def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, use_hash_exploration=False, hash_length=16, model_type='mc', tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_old_deck_prob=0.0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, use_coach=False):
+def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compare: str = None, discount=0.99, decay_factor=1.2, combos=False, verbose=False, random_seed=1, single_process=False, epsilon=0.01, use_hash_exploration=False, hash_length=16, model_type='mc', tau=0.995, kitty_agent='fc', eval_agent_type='random', learn_from_eval=False, reuse_times=0, warmup_games=0, tutorial_prob=0.0, oracle_duration=0, explore=False, dynamic_kitty=False, use_coach=False):
     os.makedirs(model_folder, exist_ok=True)
     torch.manual_seed(0)
     random.seed(random_seed)
@@ -117,13 +125,21 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
         declare_agent = declare_model.load_state_dict(torch.load(f'{model_folder}/declare.pt', map_location=device), strict=False)
         print("Using loaded model for declaration")
     declare_agent = DeclareAgent('declare', declare_model, tau=tau)
-    
     if kitty_agent == 'fc':
-        kitty_model = train_models.KittyModel().to(device)
+        kitty_model = train_models.KittyModel(dynamic_kitty=dynamic_kitty).to(device)
         if os.path.exists(f'{model_folder}/kitty.pt'):
             kitty_model.load_state_dict(torch.load(f'{model_folder}/kitty.pt', map_location=device), strict=False)
+            with open(f'{model_folder}/state.pkl', mode='rb') as f:
+                state = pickle.load(f)
+                dynamic_kitty = state.get('dynamic_kitty', False)
+            if dynamic_kitty:
+                kitty_agent = KittyAgent('kitty', kitty_model, tau=tau, dynamic_kitty=True)
+            else:
+                kitty_agent = KittyAgent('kitty', kitty_model, tau=tau)
             print("Using loaded model for kitty")
-        kitty_agent = KittyAgent('kitty', kitty_model, tau=tau)
+        else:
+            kitty_agent = KittyAgent('kitty', kitty_model, tau=tau, dynamic_kitty=dynamic_kitty)
+        if dynamic_kitty: print("Using dynamic kitty encoding")
     elif kitty_agent == 'argmax':
         kitty_model = train_models.KittyArgmaxModel().to(device)
         if os.path.exists(f'{model_folder}/kitty_argmax.pt'):
@@ -161,7 +177,7 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
             value_model.load_state_dict(torch.load(f'{model_folder}/value.pt', map_location=device))
             print("Using loaded value model")
         value_model.share_memory()
-
+        print("Using Q learning main agent")
         main_agent = QLearningMainAgent('main', main_model, value_model, discount=discount, hash_model=hash_autoencoder, tau=tau)
     
     if use_coach:
@@ -206,7 +222,7 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
         eval_kitty_model = eval_models.KittyModel().to(device)
         eval_kitty_model.load_state_dict(torch.load(f'{compare}/kitty.pt', map_location=device), strict=False)
         print(f"Using kitty model in {compare} for comparison")
-        eval_kitty = KittyAgent("kitty", eval_kitty_model)
+        eval_kitty = KittyAgent("kitty", eval_kitty_model, dynamic_kitty=eval_state.get('dynamic_kitty', False))
 
         eval_declare_model = eval_models.DeclarationModel().to(device)
         eval_declare_model.load_state_dict(torch.load(f'{compare}/declare.pt', map_location=device), strict=False)
@@ -258,9 +274,9 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
         shutil.copyfile('networks/Models.py', f'{model_folder}/Models.py')
     
     if not eval_only:
-        processes_count = 8
+        processes_count = 8 if model_type == 'mc' else 6
         for i in range(1 if single_process else processes_count):
-            actor = ctx.Process(target=sampler, args=(i, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor ** (1 / games), global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, global_coach_queue, combos, epsilon, reuse_old_deck_prob, warmup_games // processes_count, tutorial_prob, oracle_duration // processes_count, coach_model))
+            actor = ctx.Process(target=sampler, args=(i, main_agent, declare_agent, kitty_agent, chaodi_agent, discount, decay_factor ** (1 / games), global_main_queue, global_chaodi_queue, global_declare_queue, global_kitty_queue, global_coach_queue, combos, epsilon, reuse_times, warmup_games // processes_count, tutorial_prob, oracle_duration // processes_count, explore, coach_model))
             actor.start()
             actor_processes.append(actor)
             
@@ -296,7 +312,6 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
                     coach_model.optimizer.zero_grad()
                     coach_loss.backward()
                     coach_model.optimizer.step()
-                    print(coach_loss.cpu().detach().item())
                     coach_losses.append(coach_loss.cpu().detach().item())
             for agent in (declare_agent, kitty_agent, chaodi_agent, main_agent):
                 torch.save(agent.model.state_dict(), f'{model_folder}/{agent.name}.pt')
@@ -304,7 +319,7 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
                 torch.save(coach_model.state_dict(), f'{model_folder}/coach.pt')
             print('main loss:', np.mean(main_agent.train_loss_history), 'declare loss:', np.mean(declare_agent.train_loss_history), 'kitty loss:', np.mean(kitty_agent.train_loss_history), 'chaodi loss:', np.mean(chaodi_agent.train_loss_history))
             if coach_loss:
-                print('coach loss:', np.mean(coach_loss))
+                print('coach loss:', np.mean(coach_losses))
             
             if use_hash_exploration:
                 torch.save(hash_autoencoder.state_dict(), f'{model_folder}/state_ae.pt')
@@ -352,7 +367,7 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
             level_counts = eval_sim.level_counts
             opposition_points = eval_sim.opposition_points
         else:
-            eval_count = 5 if not eval_only else 12
+            eval_count = 6 if not eval_only else 16
             eval_size = max(1, eval_size // eval_count * eval_count) # Must be multiple of eval_count
             win_counts = [0, 0] # Defenders, opponents
             level_counts = [0, 0]
@@ -423,8 +438,9 @@ def train(games: int, model_folder: str, eval_only: bool, eval_size: int, compar
                     'chaodi_optim_state': chaodi_agent.optimizer.state_dict(),
                     'hash_model_optim_state': hash_autoencoder.optimizer.state_dict() if hash_autoencoder else None,
                     'value_optim_state': main_agent.value_optimizer.state_dict() if isinstance(main_agent, QLearningMainAgent) else None,
+                    'oracle_duration': oracle_duration,
+                    'dynamic_kitty': dynamic_kitty,
                     'coach_optim_state': coach_model.optimizer.state_dict() if coach_model else None,
-                    'oracle_duration': oracle_duration
                 }, f)
         else:
             break
@@ -451,10 +467,12 @@ if __name__ == '__main__':
     parser.add_argument('--kitty-agent', type=str, default='fc', choices=['fc', 'argmax', 'rnn', 'lstm'])
     parser.add_argument('--eval-agent', type=str, default='random', choices=['random', 'interactive', 'strategic'])
     parser.add_argument('--learn-from-eval', action='store_true')
-    parser.add_argument('--reuse-old-deck-prob', type=float, default=0)
+    parser.add_argument('--reuse-times', type=int, default=0)
     parser.add_argument('--warmup-games', type=int, default=0)
     parser.add_argument('--tutorial-prob', type=float, default=0.0)
     parser.add_argument('--oracle-duration', type=int, default=0)
+    parser.add_argument('--explore', action='store_true')
+    parser.add_argument('--dynamic-kitty', action='store_true')
     parser.add_argument('--use-coach', action='store_true')
     args = parser.parse_args()
-    train(args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.hash_exploration, args.hash_length, args.model_type, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_old_deck_prob, args.warmup_games, args.tutorial_prob, args.oracle_duration, args.use_coach)
+    train(args.games, args.model_folder, args.eval_only, args.eval_size, args.compare, args.discount, args.decay_factor, args.enable_combos, args.verbose, args.random_seed, args.single_process, args.epsilon, args.hash_exploration, args.hash_length, args.model_type, args.tau, args.kitty_agent, args.eval_agent, args.learn_from_eval, args.reuse_times, args.warmup_games, args.tutorial_prob, args.oracle_duration, args.explore, args.dynamic_kitty, args.use_coach)

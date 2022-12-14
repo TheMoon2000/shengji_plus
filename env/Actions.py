@@ -1,6 +1,6 @@
 # Defines all potential actions that a player can take during a game.
 from .CardSet import CardSet, MoveType
-from .utils import LETTER_RANK, ORDERING, ORDERING_INDEX, Declaration, TrumpSuite
+from .utils import LETTER_RANK, ORDERING, ORDERING_INDEX, CardSuit, Declaration, TrumpSuite, get_rank, get_suite
 import torch
 
 class Action:
@@ -49,6 +49,43 @@ class PlaceKittyAction(Action):
     def tensor(self) -> torch.Tensor:
         "Shape: (1,)"
         return torch.tensor(ORDERING_INDEX[self.card])
+    
+    def get_dynamic_tensor(self, dominant_suit: TrumpSuite, dominant_rank: int):
+        card_rank = get_rank(self.card, dominant_suit, dominant_rank) # 3 - 14
+        card_suit = get_suite(self.card, dominant_suit, dominant_rank)
+
+        index = 0
+        for suit in [TrumpSuite.DIAMOND, TrumpSuite.CLUB, TrumpSuite.HEART, TrumpSuite.SPADE]:
+            if suit != dominant_suit:
+                if suit == card_suit:
+                    return torch.tensor(index + card_rank - 3)
+                else:
+                    index += 12
+                
+        if self.card == TrumpSuite.XJ:
+            return torch.tensor(52)
+        elif self.card == TrumpSuite.DJ:
+            return torch.tensor(53)
+        
+        if not dominant_suit.is_NT:
+            if card_rank <= 14:
+                return torch.tensor(index + card_rank - 3)
+            else:
+                index = 48
+
+        raw_suit = self.card[-1]
+        if raw_suit == dominant_suit:
+            return torch.tensor(51)
+        for suit in [TrumpSuite.DIAMOND, TrumpSuite.CLUB, TrumpSuite.HEART, TrumpSuite.SPADE]:
+            if suit != dominant_suit:
+                if raw_suit == suit:
+                    return torch.tensor(index)
+                else:
+                    index += 1
+        
+        raise AssertionError(f"Error: {self.card}")
+        
+
 
 class PlaceAllKittyAction(Action):
     "Chooses 8 cards to discard."

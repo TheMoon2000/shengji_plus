@@ -104,9 +104,10 @@ class DeclareAgent(DeepAgent):
 
 
 class KittyAgent(DeepAgent):
-    def __init__(self, name: str, model: KittyModel, batch_size=32, tau=0.995) -> None:
+    def __init__(self, name: str, model: KittyModel, batch_size=32, tau=0.995, dynamic_kitty=False) -> None:
         super().__init__(name, model, batch_size, tau=tau)
         self.model: KittyModel
+        self.dynamic_kitty = dynamic_kitty
     
     def act(self, obs: Observation, explore=False, epsilon=None, training=True):
         def reward(a: Action):
@@ -119,7 +120,14 @@ class KittyAgent(DeepAgent):
             return random.choice(obs.actions)
             # return random.choices(obs.actions, softmax([reward(a).cpu().item() for a in obs.actions]))[0]
         else:
-            return max(obs.actions, key=reward)
+            if not training:
+                logging.debug("Probability of actions:")
+                sorted_actions = sorted(obs.actions, key=reward, reverse=True)
+                for i, action in enumerate(sorted_actions):
+                    logging.debug(f"{i:2}. {action} (reward={round(reward(action).cpu().item(), 4)})")
+                return sorted_actions[0]
+            else:
+                return max(obs.actions, key=reward)
     
     def prepare_batch_inputs(self, samples: List[Tuple[Observation, Action, float]]):
         state_batch = torch.zeros((len(samples), 172))
@@ -133,9 +141,14 @@ class KittyAgent(DeepAgent):
                 obs.trump_tensor, # (20,)
                 obs.declarer_position_tensor, # (4,)
                 obs.perceived_trump_cardsets, # (36,)
+                # TODO: add kitty to state
             ])
             state_batch[i] = state_tensor
-            action_batch[i] = ac.tensor
+            if self.dynamic_kitty:
+                action_batch[i] = ac.get_dynamic_tensor(obs.dominant_suit, obs.dominant_rank)
+                assert action_batch[i].item() < 54
+            else:
+                action_batch[i] = ac.tensor
             gt_rewards[i] = rw
         device = next(self.model.parameters()).device
         return state_batch.to(device), action_batch.to(device), gt_rewards.to(device)
@@ -414,7 +427,7 @@ class QLearningMainAgent(DeepAgent):
             self.optimizer.step()
 
             # Update Value network
-            pred_values = self.value_network(state_and_action[:, :-108], history)
+            pred_values = self.value_network(state_and_action[:, :-109], history)
             v_loss = self.loss_fn(pred_values, target_values)
 
             self.value_optimizer.zero_grad()
@@ -432,42 +445,44 @@ class QLearningMainAgent(DeepAgent):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
     
     def prepare_batch_inputs(self, samples: List[Tuple[Observation, Action, float, Union[Observation, None]]]):
-        x_batch = torch.zeros((len(samples), 1196 - 3 * 108))
+        x_batch = torch.zeros((len(samples), 1089 - 2 * 108))
         next_state_batch = torch.zeros((len(samples), 1088 - 3 * 108))
-        history_batch = torch.zeros((len(samples), 20, 436)) # Store up to last 15 rounds of history
-        next_history_batch = torch.zeros((len(samples), 20, 436))
+        history_batch = torch.zeros((len(samples), 15, 436)) # Store up to last 15 rounds of history
+        next_history_batch = torch.zeros((len(samples), 15, 436))
         gt_rewards = torch.zeros((len(samples), 1))
         terminals = torch.zeros(len(samples), 1)
         for i, (obs, ac, rw, next_obs) in enumerate(samples):
-            historical_moves, current_moves = obs.historical_moves_tensor
+            historical_moves, current_moves = obs.historical_moves_dynamic_tensor
+            cardset = ac.move.cardset if isinstance(ac, LeadAction) else ac.cardset
             state_tensor = torch.cat([
-                # obs.perceived_cardsets, # (432,)
-                obs.hand.tensor,
+                obs.dynamic_hand_tensor,
                 obs.dealer_position_tensor, # (4,)
                 obs.trump_tensor, # (20,)
                 obs.declarer_position_tensor, # (4,)
                 obs.chaodi_times_tensor, # (4,)
                 obs.points_tensor, # (80,)
-                obs.unplayed_cards_tensor, # (108,)
+                obs.unplayed_cards_dynamic_tensor, # (108,)
                 current_moves, # (328,)
-                obs.kitty_tensor, # (108,)
+                obs.kitty_dynamic_tensor, # (108,)
+                obs.dominates_all_tensor(cardset),
             ])
-            x_batch[i] = torch.cat([state_tensor, ac.tensor])
+            assert isinstance(ac, LeadAction) or isinstance(ac, FollowAction)
+            x_batch[i] = torch.cat([state_tensor, ac.dynamic_tensor(obs.dominant_suit, obs.dominant_rank)])
             history_batch[i] = historical_moves
             
             if next_obs is not None:
-                next_historical_moves, next_current_moves = next_obs.historical_moves_tensor
+                next_historical_moves, next_current_moves = next_obs.historical_moves_dynamic_tensor
                 next_state_tensor = torch.cat([
                     # next_obs.perceived_cardsets, # (432,)
-                    next_obs.hand.tensor, # (108,)
+                    next_obs.dynamic_hand_tensor, # (108,)
                     next_obs.dealer_position_tensor, # (4,)
                     next_obs.trump_tensor, # (20,)
                     next_obs.declarer_position_tensor, # (4,)
                     next_obs.chaodi_times_tensor, # (4,)
                     next_obs.points_tensor, # (80,)
-                    next_obs.unplayed_cards_tensor, # (108,)
+                    next_obs.unplayed_cards_dynamic_tensor, # (108,)
                     next_current_moves, # (328,)
-                    next_obs.kitty_tensor
+                    next_obs.kitty_dynamic_tensor
                 ])
                 next_state_batch[i] = next_state_tensor
                 next_history_batch[i] = next_historical_moves

@@ -39,6 +39,7 @@ class Game:
         
         self.stage = Stage.declare_stage
         self.kitty_stage_completed = False # True if the kitty is fixed.
+        self.kitty_owner = dealer_position
         self.dominant_rank = dominant_rank
         self.declarations: List[Declaration] = [] # Information about who declared the trump suite, what it is, and its level
         self.current_declaration_turn: AbsolutePosition = None # Once a player declares a trump suite, every other player takes turn to decide if they want to override.
@@ -139,7 +140,7 @@ class Game:
             unplayed_cards = self.unplayed_cards.copy(),
             leads_current_trick = self.round_history[-1][0] == position if self.round_history else position == self.dealer_position,
             chaodi_times = self.chaodi_times,
-            kitty = self.kitty.copy() if (self.declarations and position == self.declarations[-1].absolute_position) or (not self.declarations and self.dealer_position == position) else None,
+            kitty = self.kitty.copy() if position == self.kitty_owner else None,
             is_chaodi_turn = self.current_chaodi_turn == position,
             perceived_left = self.public_cards[position.last_position].copy(),
             perceived_right = self.public_cards[position.next_position].copy(),
@@ -185,6 +186,7 @@ class Game:
             
             if self.dealer_position is None or self.is_initial_game:
                 self.dealer_position = player_position # Round 1, player becomes dealer (抢庄)
+                self.kitty_owner = player_position
             self.declarations.append(action.declaration)
             self.public_cards[player_position].add_card(*action.declaration.get_card(self.dominant_rank))
             logging.info(f"Player {player_position} declared {action.declaration.suite} x {1 + int(action.declaration.level >= 1)}")
@@ -280,6 +282,7 @@ class Game:
             self.hands[player_position].add_cardset(self.kitty) # Player picks up kitty
             self.kitty.remove_cardset(self.kitty)
             self.public_cards[player_position].add_card(*action.declaration.get_card(self.dominant_rank))
+            self.kitty_owner = player_position
             logging.info(f"Player {player_position} chose to chaodi using {action.declaration.suite}")
             self.stage = Stage.kitty_stage
             self.chaodi_times[['N', 'W', 'S', 'E'].index(player_position)] += 1
